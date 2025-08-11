@@ -101,6 +101,9 @@ class GPT(nn.Module):
         # lm_head: linear model head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight # 파라미터 절약 (768 * 50257 = 38M)
+        
     # STEP2: implement forward pass
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -109,6 +112,7 @@ class GPT(nn.Module):
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # forward the token and posisition embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+                                                                      # idx와 같은 device에 있어야 한다. 불일치가 없도록
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
@@ -118,7 +122,10 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # (B*T, vocab_size), (B*T,)
+        return logits, loss
         
     # STEP1: load weights from huggingface - NO HAVE TO READ THIS
     @classmethod
@@ -172,28 +179,98 @@ class GPT(nn.Module):
     
 # -------------------------------------------------------------------------
 
-# STEP1 CLEAR!
-# model = GPT.from_pretrained('gpt2')
-# print("didn't crash yay!")
+import tiktoken # encoding 해주는 library
 
-# STEP2 CLEAR!
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B # B: batch size
+        self.T = T # T: sequence length
+        
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        # tokenize
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        
+        # state
+        self.current_position = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1] 
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading th next batch would be out of bounds, reset
+        # 넘어가면 다시 처음부터 시작한다
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+# -------------------------------------------------------------------------
+
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = "mps"  # Apple Silicon GPU
+print(f"using device: {device}")
+device = "cpu" # 잠깐 덮어쓰기
+
+train_loader = DataLoaderLite(B=4, T=32) # batch size 4, sequence length 32
+
+# get logits
+model = GPT(GPTConfig()) # from-scratch initialized model = randomly initialized
+                         # 해보면 완전히 별로다 - 완전 랜덤하게 초기화하였기 때문에 (학습x)
+model.to(device) # 해당 device로 모델을 옮긴다
+# logits, loss = model(x, y) # forward pass + calculate loss
+# 시작 loss = 11, 목표 loss = -ln(1/50257) = 10.8
+
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW optimizer
+for i in range(50):
+    x, y = train_loader.next_batch() # get the next batch
+    x, y = x.to(device), y.to(device) # 너무 많은 메모리를 GPU에 두고 있지 않도록 이때 옮긴다
+    optimizer.zero_grad() # 매번 gradient 초기화해준다 = 기울기가 누적되면 안되니까
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step() 
+    print(f"step {i}, loss: {loss.item()}") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
+                                            # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
+    
+
+
+
+
+
+
+import sys; sys.exit(0) # 여기까지만 확인하기 위해 프로그램 종료
+
+
+
+
+
+
+# prefix tokens
 num_return_sequences = 5
 max_length = 30
 
+# STEP1 (load weight) CLEAR!
 # model = GPT.from_pretrained('gpt2') # 사전 학습된 가중치를 그대로 받아서 GPT를 돌려보았다
-model = GPT(GPTConfig()) # from-scratch initialized model = randomly initialized
-# 해보면 완전히 별로다 - 완전 랜덤하게 초기화하였기 때문에 (학습x)
 model.eval()
-model.to('cuda') # GPU로 옮기는 것이다
+'''
 
-# make prefix tokens = input
-import tiktoken # encoding 해주는 library
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8) = 같은 prefix에 대해 5번 실행한다(B=5)
-x = tokens.to('cuda')
+x = tokens.to(device) # 해당 device로 토큰(텐서)을 옮긴다
 
+# STEP2 (forward pass) ClEAR!
 # generate! right now x is (B, T) where B = 5, T = 8
 # x를 시퀀스에 추가해가면서 토큰을 생성한다
 # set the seed to 42
@@ -223,6 +300,4 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist() # tolist: 텐서를 리스트로 변환
     decoded = enc.decode(tokens) # tokens -> text
     print(">", decoded)
-        
-######### 40:11 #########
-# 원격 서버에서 돌려보기 
+'''
