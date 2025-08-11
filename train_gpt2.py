@@ -176,11 +176,13 @@ class GPT(nn.Module):
 # model = GPT.from_pretrained('gpt2')
 # print("didn't crash yay!")
 
-# STEP2
+# STEP2 CLEAR!
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
+# model = GPT.from_pretrained('gpt2') # 사전 학습된 가중치를 그대로 받아서 GPT를 돌려보았다
+model = GPT(GPTConfig()) # from-scratch initialized model = randomly initialized
+# 해보면 완전히 별로다 - 완전 랜덤하게 초기화하였기 때문에 (학습x)
 model.eval()
 model.to('cuda') # GPU로 옮기는 것이다
 
