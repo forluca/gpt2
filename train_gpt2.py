@@ -15,6 +15,8 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # 분산을 일정하게 초기화하기 위한 일종의 플래그(flag)
+                                           # 더 좋은 방법이 있을거라 하셨지만, 자기는 모르겠댘ㅋㅋㅋㅋㅋ
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -51,6 +53,7 @@ class MLP(nn.Module):
         # 근사 버전을 안써도 좋지만, gpt2는 tanh 근사 버전을 쓴다
         self.gelu   = nn.GELU(approximate='tanh') # relu랑 비슷한데 완벽하게 flat하지 않다
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         # Feedforward network
@@ -71,7 +74,7 @@ class Block(nn.Module):
     def forward(self, x):
         # add & norm이 attn, mlp 앞에 들어간다! 
         # add를 통해 gradient flow를 원활하게 한다
-        x = x + self.attn(self.ln_1(x))
+        x = x + self.attn(self.ln_1(x)) # residual! 분산이 증가한다
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -102,7 +105,25 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         # weight sharing scheme
+        # 초기화도 두번되지만 문제없다
         self.transformer.wte.weight = self.lm_head.weight # 파라미터 절약 (768 * 50257 = 38M)
+        
+        # init params
+        # nn.Module.apply(fn): 현재 모듈과 그 안에 포함된 모든 하위 모듈(layer) 에 대해 fn(module)을 재귀적으로 호출
+        self.apply(self._init_weights) # apply the weight init function to all parameters
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02 # 0.02로 설정. 모델 크기에 따라 다르게 설정하는 것이 합리적이지만, GPT-2 논문에서는 0.02로 설정
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5 # 1/root(N) scale the std by the number of layers
+                                                         # MLP의 각 블록마다 2개의 residual connection이 있기 때문에
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std) # normal distribution
+            if module.bias is not None:
+                # pytorch에서는 uniform이 기본이기 때문에, bias는 0으로 초기화
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # 논문에서는 0.01이었는데 그냥 0.02로
         
     # STEP2: implement forward pass
     def forward(self, idx, targets=None):
@@ -215,15 +236,24 @@ class DataLoaderLite:
 # -------------------------------------------------------------------------
 
 # attempt to autodetect the device
+import time
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = "mps"  # Apple Silicon GPU
 print(f"using device: {device}")
-device = "cpu" # 잠깐 덮어쓰기
 
-train_loader = DataLoaderLite(B=4, T=32) # batch size 4, sequence length 32
+# set the random seed for reproducibility(재현성)
+# 초기 weight가 동일하게 초기화되도록 -> 일관되게 재현 가능
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+# data loader
+train_loader = DataLoaderLite(B=16, T=1024) # batch size, sequence length
+                                            # gpt2 maximum sequence length = 1024
 
 # get logits
 model = GPT(GPTConfig()) # from-scratch initialized model = randomly initialized
@@ -235,14 +265,20 @@ model.to(device) # 해당 device로 모델을 옮긴다
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW optimizer
 for i in range(50):
+    t0 = time.time() # 시작 시간
+    
     x, y = train_loader.next_batch() # get the next batch
     x, y = x.to(device), y.to(device) # 너무 많은 메모리를 GPU에 두고 있지 않도록 이때 옮긴다
     optimizer.zero_grad() # 매번 gradient 초기화해준다 = 기울기가 누적되면 안되니까
     logits, loss = model(x, y)
     loss.backward()
-    optimizer.step() 
-    print(f"step {i}, loss: {loss.item()}") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
-                                            # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
+    optimizer.step()
+    
+    torch.cuda.synchronize() # GPU에서 연산이 끝날 때까지 기다린다
+    t1 = time.time() # 끝난 시간
+    dt = (t1 - t0) * 1000 # time difference in milliseconds
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
+                                                            # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
     
 
 
