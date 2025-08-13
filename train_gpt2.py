@@ -251,9 +251,12 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# data loader
-train_loader = DataLoaderLite(B=16, T=1024) # batch size, sequence length
-                                            # gpt2 maximum sequence length = 1024
+# data loader (원래는 B값이 16이지만 GPU가 안좋아서 4로 진행하기!!!!!!!!!!!!!!!)
+train_loader = DataLoaderLite(B=4, T=1024) # batch size, sequence length
+                                           # gpt2 maximum sequence length = 1024
+
+# set the matmul precision to high for better performance
+torch.set_float32_matmul_precision('high') # "highest": float32, "high": tensorfloat32, "medium": bfloat16
 
 # get logits
 model = GPT(GPTConfig()) # from-scratch initialized model = randomly initialized
@@ -277,8 +280,9 @@ for i in range(50):
     torch.cuda.synchronize() # GPU에서 연산이 끝날 때까지 기다린다
     t1 = time.time() # 끝난 시간
     dt = (t1 - t0) * 1000 # time difference in milliseconds
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
-                                                            # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) # B * T / time
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
+                                                                                           # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
     
 
 
