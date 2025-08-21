@@ -1,11 +1,12 @@
+import os
 import math
+import time
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 # -------------------------------------------------------------------------
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -36,10 +37,13 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B, nh, T, T)
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, hs)
+        
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B, nh, T, T)
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -198,27 +202,64 @@ class GPT(nn.Module):
 
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that requre grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for pn, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for pn, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)        
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused) # AdamW optimizer, hyperparameters: gpt3 paper
+        return optimizer
+    
 # -------------------------------------------------------------------------
-
 import tiktoken # encoding 해주는 library
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename) 
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B # B: batch size
         self.T = T # T: sequence length
-        
-        # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        # tokenize
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-        
-        # state
-        self.current_position = 0
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank # 각 프로세스의 데이터 시작 위치
         
     def next_batch(self):
         B, T = self.B, self.T
@@ -226,24 +267,52 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T
-        # if loading th next batch would be out of bounds, reset
-        # 넘어가면 다시 처음부터 시작한다
-        if self.current_position + B * T + 1 > len(self.tokens):
-            self.current_position = 0
+        self.current_position += B * T * self.num_processes # 다음 배치로 넘어간다
+        # if loading the next batch would be out of bounds, advance to next shard
+        # 넘어가면 다음 shard에서 시작한다
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x, y
 
 # -------------------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
-# attempt to autodetect the device
-import time
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = "mps"  # Apple Silicon GPU
-print(f"using device: {device}")
+# set up DDP (distributed data parallel)
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK']) # 프로세스의 번호
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # 한 노드(서버)안에서의 프로세스 번호, 단일 노드라면 신경쓸 필요 없음
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # GPU 개수
+    device = f'cuda:{ddp_local_rank}' 
+    torch.cuda.set_device(device) 
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run, single GPU training
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect the device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = "mps"  # Apple Silicon GPU
+    print(f"using device: {device}")
 
 # set the random seed for reproducibility(재현성)
 # 초기 weight가 동일하게 초기화되도록 -> 일관되게 재현 가능
@@ -251,93 +320,154 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# data loader (원래는 B값이 16이지만 GPU가 안좋아서 4로 진행하기!!!!!!!!!!!!!!!)
-train_loader = DataLoaderLite(B=4, T=1024) # batch size, sequence length
-                                           # gpt2 maximum sequence length = 1024
+enc = tiktoken.get_encoding("gpt2")
+
+# data loader (B값은 자기 GPU의 메모리 크기에 따라 조정!)
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 4 # micro batch size
+T = 1024 # sequence length, gpt2 maximum sequence length = 1024
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process: # master process가 출력을 맡는다 (한번만 출력되어야 하니까)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 # set the matmul precision to high for better performance
 torch.set_float32_matmul_precision('high') # "highest": float32, "high": tensorfloat32, "medium": bfloat16
 
-# get logits
-model = GPT(GPTConfig()) # from-scratch initialized model = randomly initialized
-                         # 해보면 완전히 별로다 - 완전 랜덤하게 초기화하였기 때문에 (학습x)
+# create the model
+model = GPT(GPTConfig(vocab_size=50304)) # from-scratch initialized model = randomly initialized
+                                         # 해보면 완전히 별로다 - 완전 랜덤하게 초기화하였기 때문에 (학습x)
+                                         # vocab_size=50304: nice number!
 model.to(device) # 해당 device로 모델을 옮긴다
-# logits, loss = model(x, y) # forward pass + calculate loss
-# 시작 loss = 11, 목표 loss = -ln(1/50257) = 10.8
+model = torch.compile(model) # torch.compile: PyTorch 2.0에서 제공하는 컴파일러로, 모델을 최적화하여 실행 속도를 높인다
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank]) # wrap the model, 모든 프로세스의 gradient를 동기화하고, 평균을 내준다
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+# learning rate scheduler: gpt3 paper
+max_lr = 6e-4 
+min_lr = max_lr * 0.1
+warmup_steps = 715 # first 375M tokens, 375e6 / 2**19
+max_steps = 19073 # 10e9 / 2**19
+def get_lr(it): 
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learing rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1 # decay_ratio should be in [0, 1]
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW optimizer
-for i in range(50):
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device) # 직접 구현한 optimizer
+
+for step in range(max_steps):
     t0 = time.time() # 시작 시간
     
-    x, y = train_loader.next_batch() # get the next batch
-    x, y = x.to(device), y.to(device) # 너무 많은 메모리를 GPU에 두고 있지 않도록 이때 옮긴다
+    # once in a while evaluate our validation loss
+    if step % 1000 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad(): # no gradient calculation for validation
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device) 
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            
+    # once in a while generate from the model (except step 0, which is noise)
+    # disabled because torch.complie throws a scary error i can't solve rn
+    # if you disable torch.compile, this code works fine
+    if step > 0 and step % 100 == 0 and False:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device) # rng: random number generator
+        sample_rng.manual_seed(42 + ddp_rank)
+        with xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad(): # no backward = gradient tracking 비활성화 -> 메모리 절약
+                logits, loss = model(xgen) # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50 (huggingface pipline default)
+                # topk_probs here becomes (5,50), topk_indices is (5,50)
+                # top 50만 고려하니까 모델이 탈선할 일도 없다
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, 1, ix) # (B, 1) - 인덱스에 해당하는 token을 가져온다 = 다음 토큰
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist() # tolist: 텐서를 리스트로 변환
+            decoded = enc.decode(tokens) # tokens -> text
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+     
+    # training loop
+    model.train()
     optimizer.zero_grad() # 매번 gradient 초기화해준다 = 기울기가 누적되면 안되니까
-    logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch() # get the next batch
+        x, y = x.to(device), y.to(device) # 너무 많은 메모리를 GPU에 두고 있지 않도록 이때 옮긴다
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): # bfloat16: Ampere GPU 이상 에서만 지원
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        loss = loss / grad_accum_steps # 꼭 나눠줘야 한다!
+        loss_accum += loss.detach() # 출력을 위한 loss
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # 마지막 마이크로 스텝에서만 gradient를 동기화한다
+        loss.backward()
+        
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # 모든 프로세스의 loss를 평균낸다
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gpt3 paper
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     
     torch.cuda.synchronize() # GPU에서 연산이 끝날 때까지 기다린다
     t1 = time.time() # 끝난 시간
-    dt = (t1 - t0) * 1000 # time difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) # B * T / time
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
-                                                                                           # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
-    
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt # B * T / time
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}") # loss는 텐서이기 때문에 .item()으로 값을 가져온다
+                                                                                                                                                         # .item()을 호출하면 GPU에 있던 텐서를 CPU로 옮겨서 숫자로 변환한다
+if ddp:
+    destroy_process_group() # DDP를 종료한다
 
 
 
 
 
-
-import sys; sys.exit(0) # 여기까지만 확인하기 위해 프로그램 종료
-
-
-
-
-
-
-# prefix tokens
-num_return_sequences = 5
-max_length = 30
-
-# STEP1 (load weight) CLEAR!
-# model = GPT.from_pretrained('gpt2') # 사전 학습된 가중치를 그대로 받아서 GPT를 돌려보았다
-model.eval()
-'''
-
-tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8) = 같은 prefix에 대해 5번 실행한다(B=5)
-x = tokens.to(device) # 해당 device로 토큰(텐서)을 옮긴다
-
-# STEP2 (forward pass) ClEAR!
-# generate! right now x is (B, T) where B = 5, T = 8
-# x를 시퀀스에 추가해가면서 토큰을 생성한다
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad(): # no backward = gradient tracking 비활성화 -> 메모리 절약
-        logits = model(x) # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipline default)
-        # topk_probs here becomes (5,50), topk_indices is (5,50)
-        # top 50만 고려하니까 모델이 탈선할 일도 없다
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, 1, ix) # (B, 1) - 인덱스에 해당하는 token을 가져온다 = 다음 토큰
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
-        
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist() # tolist: 텐서를 리스트로 변환
-    decoded = enc.decode(tokens) # tokens -> text
-    print(">", decoded)
-'''
